@@ -1,15 +1,19 @@
-import math
 import networkx as nx
-from config import HOLD_DURATION, HOLD_COOLDOWN, SLOWDOWN_DURATION
+from config import (
+    HOLD_DURATION, HOLD_COOLDOWN,
+    SLOWDOWN_DURATION, SLOWDOWN_COOLDOWN,
+    LANE_SLOW_COOLDOWN,
+)
 from path_utils import route_distance_traveled, route_remaining_distance
 from llm_interface import get_llm_decision
 
 BATTERY_PRIORITY_THRESHOLD = 5.0
 REROUTE_COST_THRESHOLD = 0.5
-_VIRTUAL_NODES = {"C_UP_1", "C_UP_2"}
+REROUTE_PENALTY_FACTOR = 50.0  # edge-weight multiplier applied to conflict node's edges
+
 
 def choose_loser(drone1, drone2, graph, event_type=None):
-    """Deterministic safety fallback only. The LLM controller is the primary decision layer."""
+    """Deterministic safety fallback. Used when LLM output is invalid."""
     if event_type == "same_lane_spacing" and drone1.route == drone2.route and drone1.route:
         s1 = route_distance_traveled(drone1, graph)
         s2 = route_distance_traveled(drone2, graph)
@@ -32,6 +36,7 @@ def choose_loser(drone1, drone2, graph, event_type=None):
 
     return (drone1, drone2) if drone1.id > drone2.id else (drone2, drone1)
 
+
 def decision_explanation(loser, winner, graph, event_type, llm_decision=None):
     r_loser = route_remaining_distance(loser, graph)
     r_winner = route_remaining_distance(winner, graph)
@@ -44,6 +49,7 @@ def decision_explanation(loser, winner, graph, event_type, llm_decision=None):
         f"event={event_type}, mode={mode}"
     )
 
+
 def apply_hold(drone, current_time, duration=HOLD_DURATION):
     if current_time < drone.hold_cooldown_until:
         return False
@@ -51,25 +57,39 @@ def apply_hold(drone, current_time, duration=HOLD_DURATION):
         drone.hold = True
         drone.hold_until = current_time + duration
         drone.hold_cooldown_until = drone.hold_until + HOLD_COOLDOWN
-        drone.log_event(f"{drone.id} assigned HOLD until {drone.hold_until:.1f}s")
+        drone.log_event(f"{drone.id} HOLD until {drone.hold_until:.1f}s")
         return True
     drone.hold_until = max(drone.hold_until, current_time + duration)
     return False
 
+
 def apply_slowdown(drone, current_time):
     if current_time < getattr(drone, "slowed_until", 0.0):
         return False
+    # Suppress re-log within the cooldown window after the last slowdown expired
+    last_slow_end = getattr(drone, "slowed_until", 0.0)
+    if current_time < last_slow_end + SLOWDOWN_COOLDOWN and not drone.slowed:
+        return False
     drone.slowed = True
     drone.slowed_until = current_time + SLOWDOWN_DURATION
-    drone.log_event(f"{drone.id} assigned SLOWDOWN until {drone.slowed_until:.1f}s")
+    drone.log_event(f"{drone.id} SLOWDOWN until {drone.slowed_until:.1f}s")
     return True
 
-def apply_lane_slow(drone):
-    if not drone.lane_slow:
-        drone.lane_slow = True
-        drone.log_event(f"{drone.id} assigned LANE SLOW")
-        return True
-    return False
+
+def apply_lane_slow(drone, current_time):
+    """Apply lane-slow speed reduction.
+
+    drone.lane_slow is a per-tick flag reset each step, so it must be set True
+    every tick it should be active. The cooldown prevents duplicate log entries
+    while the condition persists across many ticks.
+    """
+    drone.lane_slow = True  # always set for this tick regardless of cooldown
+    if current_time < drone.lane_slow_cooldown_until:
+        return False  # still within window — flag is set but don't re-log
+    drone.lane_slow_cooldown_until = current_time + LANE_SLOW_COOLDOWN
+    drone.log_event(f"{drone.id} LANE SLOW at {current_time:.1f}s")
+    return True
+
 
 def _find_conflict_node(loser, winner):
     winner_nodes = set(winner.route[winner.route_index:])
@@ -78,14 +98,60 @@ def _find_conflict_node(loser, winner):
             return node
     return None
 
-def _build_detour_graph(graph):
-    g = graph.copy()
-    for vn in _VIRTUAL_NODES:
-        if g.has_node(vn):
-            g.remove_node(vn)
-    return g
 
-def apply_reroute(loser, winner, graph, current_time):
+def validate_action(action, target, winner, airspace, current_time):
+    """Pre-execution safety check for any LLM-selected action.
+
+    Returns (is_valid: bool, reason: str).
+    """
+    if action == "no_action":
+        return True, "ok"
+
+    if action == "hold":
+        if current_time < target.hold_cooldown_until:
+            return False, f"{target.id} is in hold cooldown until {target.hold_cooldown_until:.1f}s"
+        return True, "ok"
+
+    if action == "slowdown":
+        if target.slowed and current_time < target.slowed_until:
+            return False, f"{target.id} is already slowed until {target.slowed_until:.1f}s"
+        return True, "ok"
+
+    if action == "lane_slow":
+        return True, "ok"
+
+    if action == "reroute":
+        if target.rerouted:
+            return False, f"{target.id} already rerouted — choose hold or slowdown"
+        conflict_node = _find_conflict_node(target, winner)
+        if conflict_node is None:
+            return False, "no shared conflict node found for reroute"
+        routing_graph = airspace.get_routing_graph()
+        current_node = target.route[target.route_index]
+        goal = target.route[-1]
+        if not routing_graph.has_node(current_node) or not routing_graph.has_node(goal):
+            return False, "current or goal node not in routing graph"
+        penalized = routing_graph.copy()
+        if penalized.has_node(conflict_node):
+            for nbr in list(penalized.neighbors(conflict_node)):
+                penalized[conflict_node][nbr]["weight"] *= REROUTE_PENALTY_FACTOR
+        try:
+            candidate = nx.shortest_path(penalized, current_node, goal, weight="weight")
+            if conflict_node in candidate:
+                return False, "no viable detour around conflict node"
+        except nx.NetworkXNoPath:
+            return False, "NetworkXNoPath: no detour available"
+        return True, "ok"
+
+    return False, f"unknown action: {action}"
+
+
+def apply_reroute(loser, winner, airspace, current_time):
+    """Reroute loser around the conflict node using edge-cost penalties.
+
+    No nodes are added to or removed from the airspace graph. A temporary
+    penalized copy is used for path-finding only and is discarded afterward.
+    """
     if loser.rerouted:
         return False
 
@@ -97,38 +163,37 @@ def apply_reroute(loser, winner, graph, current_time):
     if goal == conflict_node:
         return False
 
-    detour_graph = _build_detour_graph(graph)
-    if detour_graph.has_node(conflict_node):
-        detour_graph.remove_node(conflict_node)
-
     current_node = loser.route[loser.route_index]
-    if not detour_graph.has_node(current_node) or not detour_graph.has_node(goal):
+    routing_graph = airspace.get_routing_graph()
+
+    if not routing_graph.has_node(current_node) or not routing_graph.has_node(goal):
         return False
 
+    penalized = routing_graph.copy()
+    if penalized.has_node(conflict_node):
+        for nbr in list(penalized.neighbors(conflict_node)):
+            penalized[conflict_node][nbr]["weight"] *= REROUTE_PENALTY_FACTOR
+
     try:
-        detour_path = nx.shortest_path(detour_graph, current_node, goal, weight="weight")
+        new_route = nx.shortest_path(penalized, current_node, goal, weight="weight")
     except nx.NetworkXNoPath:
         return False
 
-    reroute_node = f"R_{loser.id}"
-    if graph.has_node(reroute_node):
-        graph.remove_node(reroute_node)
+    if conflict_node in new_route:
+        return False  # solver chose conflict node despite penalty — no viable detour
 
-    graph.add_node(reroute_node, pos=(loser.x, loser.y))
-    next_node = detour_path[1] if len(detour_path) > 1 else goal
-    x1, y1 = loser.x, loser.y
-    x2, y2 = graph.nodes[next_node]["pos"]
-    graph.add_edge(reroute_node, next_node, weight=math.dist((x1, y1), (x2, y2)))
-
-    loser.route = [reroute_node] + detour_path[1:]
+    loser.route = new_route
     loser.route_index = 0
     loser.progress = 0.0
     loser.rerouted = True
     loser.slowed = False
     loser.lane_slow = False
     loser.hold = False
-    loser.log_event(f"{loser.id} REROUTED around {conflict_node} (conflict with {winner.id}) via {loser.route}")
+    loser.log_event(
+        f"{loser.id} REROUTED around {conflict_node} (conflict with {winner.id}) via {loser.route}"
+    )
     return True
+
 
 def _drone_by_id(drone1, drone2, drone_id):
     if drone1.id == drone_id:
@@ -136,6 +201,7 @@ def _drone_by_id(drone1, drone2, drone_id):
     if drone2.id == drone_id:
         return drone2
     return None
+
 
 def _append_action(actions, action, target, row, decision_rank, reason, llm_decision):
     actions.append({
@@ -148,9 +214,15 @@ def _append_action(actions, action, target, row, decision_rank, reason, llm_deci
         "reason": reason,
     })
 
-def resolve_conflicts(conflict_events, graph, current_time):
-    """Resolve conflicts with LLM as the decision-maker and Python as safety executor."""
+
+def resolve_conflicts(conflict_events, airspace, current_time):
+    """Resolve conflicts with LLM as the decision-maker and Python as safety executor.
+
+    Takes an Airspace object so that apply_reroute can call
+    airspace.get_routing_graph() without mutating the shared base graph.
+    """
     actions = []
+    base_graph = airspace._base
     priority_order = {"current_conflict": 0, "future_conflict": 1, "same_lane_spacing": 2}
     sorted_events = sorted(conflict_events, key=lambda e: priority_order.get(e["type"], 99))
 
@@ -159,66 +231,83 @@ def resolve_conflicts(conflict_events, graph, current_time):
         d2 = event["drone_2"]
         event_type = event["type"]
 
-        llm_decision = get_llm_decision(event, graph)
+        llm_decision = get_llm_decision(event, base_graph)
         target = _drone_by_id(d1, d2, llm_decision.get("target"))
         row = _drone_by_id(d1, d2, llm_decision.get("right_of_way"))
 
         if target is None or row is None or target is row:
-            target, row = choose_loser(d1, d2, graph, event_type)
+            target, row = choose_loser(d1, d2, base_graph, event_type)
             llm_decision = {
                 "action": "hold" if event_type == "current_conflict" else "slowdown",
                 "target": target.id,
                 "right_of_way": row.id,
-                "reason": "Invalid LLM command; deterministic safety fallback used.",
+                "reason": "Invalid LLM output; deterministic safety fallback used.",
                 "mode": "safety_fallback",
             }
 
-        decision_rank = decision_explanation(target, row, graph, event_type, llm_decision)
+        decision_rank = decision_explanation(target, row, base_graph, event_type, llm_decision)
         requested_action = llm_decision.get("action", "no_action")
 
+        # Safety pre-check before executing
+        is_valid, val_reason = validate_action(requested_action, target, row, airspace, current_time)
+        if not is_valid:
+            requested_action = "hold" if event_type == "current_conflict" else "slowdown"
+            llm_decision["reason"] += f" [validator overrode to {requested_action}: {val_reason}]"
+
         if event_type == "same_lane_spacing":
-            applied = apply_lane_slow(target)
-            if applied:
+            # Honour the LLM action for same_lane events; fall back to lane_slow
+            if requested_action in ("lane_slow", "no_action", "reroute"):
+                apply_lane_slow(target, current_time)
                 _append_action(actions, "lane_slow", target, row, decision_rank,
-                               f"LLM-controlled lane spacing behind {row.id}", llm_decision)
+                                f"lane spacing behind {row.id}", llm_decision)
+            elif requested_action == "hold":
+                applied = apply_hold(target, current_time)
+                if applied:
+                    _append_action(actions, "hold", target, row, decision_rank,
+                                   f"LLM selected hold for lane spacing near {row.id}", llm_decision)
+            elif requested_action == "slowdown":
+                applied = apply_slowdown(target, current_time)
+                if applied:
+                    _append_action(actions, "slowdown", target, row, decision_rank,
+                                   f"LLM selected slowdown for lane spacing near {row.id}", llm_decision)
             continue
 
         if requested_action == "reroute":
-            rerouted = apply_reroute(target, row, graph, current_time)
+            rerouted = apply_reroute(target, row, airspace, current_time)
             if rerouted:
                 _append_action(actions, "reroute", target, row, decision_rank,
-                               f"LLM selected reroute to avoid conflict with {row.id}", llm_decision)
+                                f"LLM selected reroute to avoid conflict with {row.id}", llm_decision)
                 continue
-            requested_action = "hold"
+            requested_action = "hold"  # reroute failed, escalate
 
         if requested_action == "slowdown":
             applied = apply_slowdown(target, current_time)
             if applied:
                 _append_action(actions, "slowdown", target, row, decision_rank,
-                               f"LLM selected slowdown near {row.id}", llm_decision)
+                                f"LLM selected slowdown near {row.id}", llm_decision)
             continue
 
         if requested_action == "hold":
             applied = apply_hold(target, current_time, duration=HOLD_DURATION)
             if applied:
                 _append_action(actions, "hold", target, row, decision_rank,
-                               f"LLM selected hold near {row.id}", llm_decision)
+                                f"LLM selected hold near {row.id}", llm_decision)
             continue
 
         if requested_action == "lane_slow":
-            applied = apply_lane_slow(target)
-            if applied:
-                _append_action(actions, "lane_slow", target, row, decision_rank,
-                               f"LLM selected lane slow behind {row.id}", llm_decision)
+            apply_lane_slow(target, current_time)
+            _append_action(actions, "lane_slow", target, row, decision_rank,
+                            f"LLM selected lane slow behind {row.id}", llm_decision)
             continue
 
-        # no_action is allowed only for non-current conflicts. Current conflicts get safety hold.
+        # no_action is only allowed for non-current conflicts
         if requested_action == "no_action" and event_type != "current_conflict":
             continue
 
+        # Final safety net: current_conflict with no valid action → force hold
         applied = apply_hold(target, current_time, duration=HOLD_DURATION)
         if applied:
             _append_action(actions, "hold", target, row, decision_rank,
-                           f"Safety fallback hold near {row.id}", llm_decision)
+                            f"Safety fallback hold near {row.id}", llm_decision)
 
     return actions

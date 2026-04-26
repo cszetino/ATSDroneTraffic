@@ -1,0 +1,4 @@
+case,drone_id,role,priority,altitude,completed,mission_time_s,final_battery,battery_consumed,holds_issued,slowdowns_issued,reroutes_issued,lane_slows_issued,rerouted,total_conflicts_in_case,min_separation_observed,separation_violated,worst_pair,worst_pair_time_s
+case_3_same_layer_future_conflict,D1,traffic,3,3,True,44.5,78.2,21.8,0,0,1,0,True,1,2.842,NO,"('D2', 'D3')",3.5
+case_3_same_layer_future_conflict,D2,traffic,3,3,True,18.5,50.6,49.4,0,0,0,0,False,1,2.842,NO,"('D2', 'D3')",3.5
+case_3_same_layer_future_conflict,D3,traffic,3,3,True,33.0,70.8,29.2,0,0,0,0,False,1,2.842,NO,"('D2', 'D3')",3.5

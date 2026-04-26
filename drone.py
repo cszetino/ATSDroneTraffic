@@ -12,7 +12,8 @@ class Drone:
         battery=100.0,
         initial_progress=0.0,
         forced_route=None,
-        role="traffic"
+        role="traffic",
+        altitude=None,
     ):
         self.id = drone_id
         self.start_node = start_node
@@ -24,7 +25,9 @@ class Drone:
         self.forced_route = forced_route
         self.role = role
 
-        self.altitude = ALTITUDE_LAYERS[priority]
+        # Altitude is a separate physical parameter from priority.
+        # Pass altitude explicitly to place a drone on a non-default layer.
+        self.altitude = altitude if altitude is not None else ALTITUDE_LAYERS[priority]
 
         self.route = []
         self.route_index = 0
@@ -38,8 +41,9 @@ class Drone:
         self.hold_until = 0.0
         self.hold_cooldown_until = 0.0
         self.slowed = False
-        self.slowed_until = 0.0      # FIX: slowdown now uses a timer like hold
+        self.slowed_until = 0.0
         self.lane_slow = False
+        self.lane_slow_cooldown_until = 0.0  # suppresses duplicate log entries
         self.rerouted = False
         self.ascent_zone = False
 

@@ -4,6 +4,7 @@ from config import PRIORITY_NAMES
 
 ALLOWED_ACTIONS = {"hold", "slowdown", "lane_slow", "reroute", "no_action"}
 
+
 def build_llm_decision_payload(conflict_event, graph):
     d1 = conflict_event["drone_1"]
     d2 = conflict_event["drone_2"]
@@ -32,6 +33,7 @@ def build_llm_decision_payload(conflict_event, graph):
         },
     }
 
+
 def _drone_packet(drone, graph):
     return {
         "id": drone.id,
@@ -46,8 +48,13 @@ def _drone_packet(drone, graph):
         "already_rerouted": drone.rerouted,
     }
 
-def _local_llm_fallback_decision(payload):
-    """Offline LLM-controller fallback with the same command shape as a real LLM."""
+
+def _deterministic_fallback(payload):
+    """Deterministic rule-based controller used when no real LLM is configured.
+
+    Implements the same rules as the controller_rules list in the payload.
+    Clearly labelled as deterministic so logs are unambiguous.
+    """
     d1 = payload["drone_1"]
     d2 = payload["drone_2"]
     event_type = payload["event_type"]
@@ -84,23 +91,42 @@ def _local_llm_fallback_decision(payload):
         "target": yielding["id"],
         "right_of_way": row["id"],
         "reason": (
-            f"LLM controller selected {action} for {yielding['id']} while giving "
-            f"right-of-way to {row['id']} based on conflict type, priority, battery, and remaining route."
+            f"Deterministic controller: {action} for {yielding['id']}, "
+            f"right-of-way to {row['id']} "
+            f"(event={event_type}, priority={yielding['priority']}/{row['priority']}, "
+            f"battery={yielding['battery']:.1f}/{row['battery']:.1f})"
         ),
-        "mode": "local_llm_fallback",
+        "mode": "deterministic_fallback",
     }
 
+
 def _normalize_decision(raw_decision, payload):
+    """Validate and normalise an LLM response dict.
+
+    If the response is missing required fields or contains invalid values,
+    fall back to the deterministic controller and log the fallback mode.
+    """
     if not isinstance(raw_decision, dict):
-        return _local_llm_fallback_decision(payload)
+        return _deterministic_fallback(payload)
 
     action = str(raw_decision.get("action", "")).strip().lower()
     target = str(raw_decision.get("target", "")).strip()
     right_of_way = str(raw_decision.get("right_of_way", "")).strip()
     valid_ids = {payload["drone_1"]["id"], payload["drone_2"]["id"]}
 
-    if action not in ALLOWED_ACTIONS or target not in valid_ids or right_of_way not in valid_ids or target == right_of_way:
-        return _local_llm_fallback_decision(payload)
+    if (
+        action not in ALLOWED_ACTIONS
+        or target not in valid_ids
+        or right_of_way not in valid_ids
+        or target == right_of_way
+    ):
+        fallback = _deterministic_fallback(payload)
+        fallback["reason"] = (
+            f"[LLM output invalid: action={action!r}, target={target!r}, "
+            f"row={right_of_way!r}] " + fallback["reason"]
+        )
+        fallback["mode"] = "deterministic_fallback_after_invalid_llm"
+        return fallback
 
     return {
         "action": action,
@@ -110,19 +136,28 @@ def _normalize_decision(raw_decision, payload):
         "mode": raw_decision.get("mode", "real_llm"),
     }
 
+
 def _call_real_llm_if_configured(payload):
-    # Optional hook. Keep this isolated so the project runs offline in PyCharm.
-    # Replace this function with your API call if the professor requires a live model.
+    """Hook for a live LLM API call. Returns None when no API is configured.
+
+    To wire in a real model: set USE_REAL_LLM=1 and implement the API call
+    below. The function must return a dict matching the allowed_output_schema,
+    or None to fall back to the deterministic controller.
+    """
     if os.getenv("USE_REAL_LLM", "0") != "1":
         return None
+    # Real API call goes here — not implemented in offline mode.
+    # Example: return anthropic_client.call(payload)
     return None
+
 
 def get_llm_decision(conflict_event, graph):
     payload = build_llm_decision_payload(conflict_event, graph)
     raw = _call_real_llm_if_configured(payload)
     if raw is None:
-        raw = _local_llm_fallback_decision(payload)
+        raw = _deterministic_fallback(payload)
     return _normalize_decision(raw, payload)
+
 
 def build_llm_event_summary(conflict_event, action_list):
     d1 = conflict_event["drone_1"]
@@ -141,8 +176,9 @@ def build_llm_event_summary(conflict_event, action_list):
         "decision_logic": "LLM controller chooses action; deterministic simulator validates and executes it.",
     }
 
-def get_mock_llm_response(payload):
+
+def get_mock_llm_response(summary):
     return (
-        f"LLM traffic-controller advisory: {payload['drone_1']} and {payload['drone_2']} "
-        f"have a {payload['event_type']}. Executed command: {payload['actions_taken']}."
+        f"LLM traffic-controller advisory: {summary['drone_1']} and {summary['drone_2']} "
+        f"have a {summary['event_type']}. Executed command: {summary['actions_taken']}."
     )

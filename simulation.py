@@ -4,10 +4,12 @@ from config import (
     TIME_STEP,
     SIM_DURATION,
     BATTERY_DRAIN_PER_STEP,
+    HOVER_DRAIN_MULTIPLIER,
+    SLOW_DRAIN_MULTIPLIER,
     FOLLOW_DISTANCE,
     LANE_SLOW_DISTANCE,
 )
-from conflict_detection import scan_conflicts
+from conflict_detection import scan_conflicts, is_scan_eligible
 from resolution import resolve_conflicts
 from path_utils import (
     set_position_along_route,
@@ -18,8 +20,8 @@ from path_utils import (
 
 
 class Simulation:
-    def __init__(self, graph, drones):
-        self.graph = graph
+    def __init__(self, airspace, drones):
+        self.airspace = airspace
         self.drones = drones
         self.time = 0.0
 
@@ -35,13 +37,12 @@ class Simulation:
         self._initialize_drones()
 
     def _route_avoiding_virtual_nodes(self, start, goal):
-        graph_copy = self.graph.copy()
-        for node in ["C_UP_1", "C_UP_2"]:
-            if graph_copy.has_node(node):
-                graph_copy.remove_node(node)
-        return nx.shortest_path(graph_copy, start, goal, weight="weight")
+        """Compute initial route using the base graph with virtual bypass nodes excluded."""
+        g = self.airspace.get_routing_graph(exclude_virtual=True)
+        return nx.shortest_path(g, start, goal, weight="weight")
 
     def _initialize_drones(self):
+        base = self.airspace._base
         for drone in self.drones:
             if drone.forced_route is not None:
                 drone.route = list(drone.forced_route)
@@ -51,71 +52,88 @@ class Simulation:
                 )
             drone.route_index = 0
             drone.progress = 0.0
-            x, y = self.graph.nodes[drone.start_node]["pos"]
+            x, y = base.nodes[drone.start_node]["pos"]
             drone.set_position(x, y)
             if drone.initial_progress > 0:
-                set_position_along_route(drone, self.graph, drone.initial_progress)
+                set_position_along_route(drone, base, drone.initial_progress)
+                # set_position_along_route no longer sets completed; check here
+                if route_remaining_distance(drone, base) <= 0:
+                    drone.completed = True
 
     def _activate_ascent_zone_if_needed(self):
         if not self._has_ascent_trigger or self.closure_active:
             return []
         actions = []
+        base = self.airspace._base
         for drone in self.drones:
             if drone.role != "ascent_trigger":
                 continue
-            if drone.route_index >= len(drone.route) - 1:
+            # Trigger on arrival: remaining distance near zero, not on last edge start
+            if route_remaining_distance(drone, base) < 0.05:
                 drone.completed = False
                 drone.hold = True
                 drone.ascent_zone = True
-                drone.set_position(*self.graph.nodes["C"]["pos"])
+                drone.set_position(*base.nodes["C"]["pos"])
                 self.closure_active = True
                 self.closure_node = "C"
+                self.airspace.close_node("C")  # marks C closed in Airspace; no graph mutation
                 actions.append({
                     "action": "activate_ascent_zone",
                     "target": drone.id,
-                    "reason": "Drone reached node C and converted it into an ascent zone"
+                    "reason": "Drone reached node C and converted it into an ascent zone",
                 })
                 actions.extend(self._reroute_traffic_around_c())
                 break
         return actions
 
     def _reroute_traffic_around_c(self):
+        """Reroute all drones whose remaining route passes through C.
+
+        Uses airspace.get_routing_graph() — C is already closed so the shortest
+        path naturally routes through C_UP_1 → C_UP_2. No temporary nodes are
+        added to the base graph.
+        """
         actions = []
+        base = self.airspace._base
+        routing_graph = self.airspace.get_routing_graph()  # C removed, bypass nodes kept
+
         for drone in self.drones:
             if drone.role == "ascent_trigger" or drone.completed:
                 continue
             if "C" not in drone.route:
                 continue
-            try:
-                c_index = drone.route.index("C")
-            except ValueError:
-                continue
+            c_index = drone.route.index("C")
             if drone.route_index >= c_index:
+                continue  # drone already past C
+
+            goal = drone.route[-1]
+
+            # Route from the next waypoint so the drone finishes its current edge first
+            next_node_idx = drone.route_index + 1
+            if next_node_idx >= len(drone.route):
+                continue
+            next_node = drone.route[next_node_idx]
+
+            if not routing_graph.has_node(next_node) or not routing_graph.has_node(goal):
                 continue
 
-            reroute_node = f"R_{drone.id}"
-            if self.graph.has_node(reroute_node):
-                self.graph.remove_node(reroute_node)
-            self.graph.add_node(reroute_node, pos=(drone.x, drone.y))
-            goal = drone.route[-1]
-            if drone.x < 1.75:
-                self.graph.add_edge(reroute_node, "B", weight=1.0)
-                drone.route = [reroute_node, "B", "C_UP_1", "C_UP_2", goal]
-            else:
-                self.graph.add_edge(reroute_node, "C_UP_1", weight=1.0)
-                drone.route = [reroute_node, "C_UP_1", "C_UP_2", goal]
+            try:
+                detour = nx.shortest_path(routing_graph, next_node, goal, weight="weight")
+            except nx.NetworkXNoPath:
+                continue
 
-            drone.route_index = 0
-            drone.progress = 0.0
+            # Preserve the current segment prefix so route_index/progress remain valid
+            new_route = drone.route[:drone.route_index + 1] + detour
+            drone.route = new_route
             drone.rerouted = True
             drone.slowed = False
             drone.lane_slow = False
             drone.hold = False
-            drone.log_event(f"{drone.id} rerouted around node C via bypass arc")
+            drone.log_event(f"{drone.id} rerouted around node C via bypass: {drone.route}")
             actions.append({
                 "action": "reroute",
                 "target": drone.id,
-                "reason": "Node C closed; rerouted around ascent zone"
+                "reason": "Node C closed; rerouted around ascent zone",
             })
         return actions
 
@@ -128,21 +146,17 @@ class Simulation:
                 drone.log_event(f"{drone.id} released from HOLD at {self.time:.1f}s")
 
     def _reset_per_tick_flags(self):
-        """Reset per-tick flags each step.
-
-        lane_slow is always per-tick.
-        slowed uses a timer (slowed_until) — clear it only when the timer expires,
-        so it persists for SLOWDOWN_DURATION without re-firing every tick.
-        """
+        """Reset per-tick flags and expire timer-based states."""
         for drone in self.drones:
             drone.lane_slow = False
-            # FIX: expire slowdown by timer, not by blanket reset every tick
-            if drone.slowed and self.time >= getattr(drone, "slowed_until", 0.0):
+            if drone.slowed and self.time >= drone.slowed_until:
                 drone.slowed = False
                 drone.log_event(f"{drone.id} slowdown expired at {self.time:.1f}s")
 
     def _nearest_leader_distance(self, follower):
-        follower_s = route_distance_traveled(follower, self.graph)
+        """Return the gap (in route-distance units) to the closest leader on the same route."""
+        base = self.airspace._base
+        follower_s = route_distance_traveled(follower, base)
         nearest_gap = None
         for leader in self.drones:
             if leader is follower or leader.completed:
@@ -153,25 +167,12 @@ class Simulation:
                 continue
             if leader.route != follower.route:
                 continue
-            leader_s = route_distance_traveled(leader, self.graph)
+            leader_s = route_distance_traveled(leader, base)
             gap = leader_s - follower_s
             if gap > 0:
                 if nearest_gap is None or gap < nearest_gap:
                     nearest_gap = gap
         return nearest_gap
-
-    def _apply_preemptive_lane_following(self):
-        for follower in self.drones:
-            if follower.completed or follower.role == "ascent_trigger":
-                continue
-            gap = self._nearest_leader_distance(follower)
-            if gap is None:
-                continue
-            if gap < FOLLOW_DISTANCE:
-                follower.hold = True
-                follower.hold_until = max(follower.hold_until, self.time + 0.5)
-            elif gap < LANE_SLOW_DISTANCE:
-                follower.lane_slow = True
 
     def _move_drone(self, drone):
         if drone.completed:
@@ -184,10 +185,11 @@ class Simulation:
                 drone.hold = True
                 return
             drone.completed = True
-            drone.log_event(f"{drone.id} completed mission")
+            drone.log_event(f"{drone.id} completed mission at {self.time:.1f}s")
             return
 
-        current_s = route_distance_traveled(drone, self.graph)
+        base = self.airspace._base
+        current_s = route_distance_traveled(drone, base)
         speed_factor = 1.0
         if drone.slowed:
             speed_factor *= 0.65
@@ -196,6 +198,9 @@ class Simulation:
 
         proposed_s = current_s + drone.speed * speed_factor * TIME_STEP
 
+        # Hard physical cap: never advance within FOLLOW_DISTANCE of any leader
+        # on the same route. This is a silent constraint — conflict detection
+        # handles logging and action assignment.
         for leader in self.drones:
             if leader is drone or leader.completed or leader.role == "ascent_trigger":
                 continue
@@ -203,32 +208,43 @@ class Simulation:
                 continue
             if leader.route != drone.route:
                 continue
-            leader_s = route_distance_traveled(leader, self.graph)
+            leader_s = route_distance_traveled(leader, base)
             if leader_s > current_s:
                 proposed_s = min(proposed_s, leader_s - FOLLOW_DISTANCE)
 
         proposed_s = max(proposed_s, current_s)
-        set_position_along_route(drone, self.graph, proposed_s)
+        set_position_along_route(drone, base, proposed_s)
 
-        if proposed_s >= route_total_length(self.graph, drone.route):
+        if proposed_s >= route_total_length(base, drone.route):
             if drone.role == "ascent_trigger":
                 drone.completed = False
                 drone.hold = True
             else:
                 drone.completed = True
+                drone.log_event(f"{drone.id} completed mission at {self.time:.1f}s")
 
     def _update_battery(self, drone):
-        if not drone.completed and not drone.hold:
+        """Drain battery with physically motivated rates.
+
+        Hovering (hold) costs more than cruising. Slow flight is slightly less
+        efficient per timestep than normal cruise.
+        """
+        if drone.completed:
+            return
+        if drone.hold:
+            drone.battery -= BATTERY_DRAIN_PER_STEP * HOVER_DRAIN_MULTIPLIER
+        elif drone.slowed or drone.lane_slow:
+            drone.battery -= BATTERY_DRAIN_PER_STEP * SLOW_DRAIN_MULTIPLIER
+        else:
             drone.battery -= BATTERY_DRAIN_PER_STEP
-            if drone.battery < 0:
-                drone.battery = 0
+        drone.battery = max(drone.battery, 0.0)
 
     def _log_state(self):
         snapshot = {
             "time": self.time,
             "closure_active": self.closure_active,
             "closure_node": self.closure_node,
-            "drones": []
+            "drones": [],
         }
         for drone in self.drones:
             snapshot["drones"].append({
@@ -245,31 +261,25 @@ class Simulation:
                 "rerouted": drone.rerouted,
                 "ascent_zone": drone.ascent_zone,
                 "role": drone.role,
-                "route": drone.route,
+                "route": list(drone.route),
                 "route_index": drone.route_index,
             })
         self.state_history.append(snapshot)
 
     def run(self):
+        base = self.airspace._base
         steps = int(SIM_DURATION / TIME_STEP)
 
         for _ in range(steps):
             self._release_expired_holds()
-            # FIX: reset both lane_slow and slowed each tick
             self._reset_per_tick_flags()
-            self._apply_preemptive_lane_following()
 
-            # FIX: skip conflict scanning for drones that are effectively done
-            # (remaining distance < 0.05) to prevent phantom holds against
-            # drones sitting stationary at their goal before completed flag flips
-            active_drones = [
-                d for d in self.drones
-                if not d.completed and route_remaining_distance(d, self.graph) > 0.05
-                or d.role == "ascent_trigger"
-            ]
+            # Canonical eligibility filter lives in is_scan_eligible.
+            # ascent_trigger drones are never scan-eligible and are excluded here.
+            active_drones = [d for d in self.drones if is_scan_eligible(d, base)]
 
-            conflicts = scan_conflicts(active_drones, self.graph)
-            actions = resolve_conflicts(conflicts, self.graph, self.time)
+            conflicts = scan_conflicts(active_drones, base)
+            actions = resolve_conflicts(conflicts, self.airspace, self.time)
 
             closure_actions = self._activate_ascent_zone_if_needed()
             actions.extend(closure_actions)
