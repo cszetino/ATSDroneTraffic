@@ -1,0 +1,6 @@
+case,total_drones,completed_drones,completion_rate_percent,total_ai_actions,reroutes,slowdowns,holds,lane_slows,avg_final_battery_percent,last_active_time_sec
+case_1_no_conflict,3,3,100.0,0,0,0,0,0,81.13333333333317,33.0
+case_2_altitude_deconfliction,3,3,100.0,0,0,0,0,0,70.73333333333315,34.5
+case_3_same_layer_future_conflict,3,2,66.66666666666667,1,1,0,0,0,66.46666666666648,44.5
+case_4_dynamic_ascent_zone,4,1,25.0,4,3,0,0,0,64.89999999999979,44.5
+case_5_congested_lane,4,4,100.0,9,0,9,0,0,70.14999999999986,36.5
